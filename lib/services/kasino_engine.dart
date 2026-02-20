@@ -135,18 +135,7 @@ class KasinoEngine {
         .toList();
     final comboPool = [...nonSingleCards, ...stealableCards];
     final allCombos = _findSumCombinations(comboPool, targetValue);
-
-    // Separate combos that use stolen cards from those that don't
     final stealableIds = stealableCards.map((c) => c.id).toSet();
-    final pureCombos = <List<PlayingCard>>[];
-    final stealCombos = <List<PlayingCard>>[];
-    for (final combo in allCombos) {
-      if (combo.any((c) => stealableIds.contains(c.id))) {
-        stealCombos.add(combo);
-      } else {
-        pureCombos.add(combo);
-      }
-    }
 
     if (matchingSingles.isEmpty &&
         matchingBuilds.isEmpty &&
@@ -154,33 +143,31 @@ class KasinoEngine {
       return options;
     }
 
-    // Build options: prefer pure combos, then try with stolen cards
-    void addOptions(List<List<PlayingCard>> combos) {
-      // Extract which opponent pile cards are used in these combos
+    // Helper: build a CaptureOption from a set of combos, splitting out stolen cards
+    CaptureOption buildOption(List<List<PlayingCard>> combos) {
       final usedStolen = <PlayingCard>[];
+      final cleanCombos = <List<PlayingCard>>[];
       for (final combo in combos) {
+        final tableOnly = <PlayingCard>[];
         for (final card in combo) {
           if (stealableIds.contains(card.id)) {
             usedStolen.add(card);
+          } else {
+            tableOnly.add(card);
           }
         }
+        if (tableOnly.isNotEmpty) cleanCombos.add(tableOnly);
       }
-      // Remove stolen cards from combo lists (they go in opponentPileCards)
-      final cleanCombos = combos.map((combo) =>
-          combo.where((c) => !stealableIds.contains(c.id)).toList()
-      ).where((combo) => combo.isNotEmpty).toList();
-
-      options.add(CaptureOption(
+      return CaptureOption(
         handCard: handCard,
         singles: matchingSingles,
         builds: matchingBuilds,
         combinations: cleanCombos,
         opponentPileCards: usedStolen,
-      ));
+      );
     }
 
     if (allCombos.isEmpty) {
-      // Simple: all singles + all builds, no combos
       options.add(CaptureOption(
         handCard: handCard,
         singles: matchingSingles,
@@ -190,35 +177,15 @@ class KasinoEngine {
       ));
     } else {
       // SA Rule: must take ALL singles + ALL builds + maximum combos.
-      // Try with all combos (including steal combos) for maximum capture.
-      final allComboSets = _findMaxNonOverlappingCombos(allCombos);
-      final pureComboSets = pureCombos.isNotEmpty
-          ? _findMaxNonOverlappingCombos(pureCombos)
-          : <List<List<PlayingCard>>>[];
-
-      // Add pure options first (no stealing)
-      for (final comboSet in pureComboSets) {
-        addOptions(comboSet);
-      }
-
-      // Add steal options that capture more cards than pure options
-      final maxPure = pureComboSets.isEmpty
-          ? 0
-          : pureComboSets.first.fold(0, (s, c) => s + c.length);
-      for (final comboSet in allComboSets) {
-        final totalCards = comboSet.fold(0, (s, c) => s + c.length);
-        if (totalCards > maxPure) {
-          addOptions(comboSet);
-        }
-      }
-
-      // If no options added (pure combos empty, steal combos not better), add steal anyway
-      if (options.isEmpty && allComboSets.isNotEmpty) {
-        for (final comboSet in allComboSets) {
-          addOptions(comboSet);
-        }
+      // Greedy: include steal combos to maximize total capture.
+      final comboSets = _findMaxNonOverlappingCombos(allCombos);
+      for (final comboSet in comboSets) {
+        options.add(buildOption(comboSet));
       }
     }
+
+    // Sort by total captured descending — greediest option first
+    options.sort((a, b) => b.totalCaptured.compareTo(a.totalCaptured));
 
     return options;
   }
@@ -382,26 +349,20 @@ class KasinoEngine {
       return state; // Must capture or augment existing build first
     }
 
-    // SA Rule: stealing requires simultaneously playing a hand card,
-    // UNLESS the player is augmenting their own existing build
-    // (table cards + stolen cards form the new group, hand card stays for capture).
-    if (stolenCards.isNotEmpty &&
-        handCard == null &&
-        ownedBuild?.captureValue != declaredValue) {
-      return state;
-    }
+    // SA Rule: every turn requires playing a card from hand.
+    // Stealing also requires a hand card played simultaneously.
+    if (handCard == null) return state;
 
     // Validate: player must have a card matching declared value in hand
     // (and it can't be the card being played into the build)
     final hasCapture = player.hand.any((c) =>
-        c.captureValue == declaredValue &&
-        (handCard == null || c.id != handCard.id));
+        c.captureValue == declaredValue && c.id != handCard.id);
     if (!hasCapture) return state;
 
     // Collect all cards that form the build
     final allBuildCards = <PlayingCard>[
       ...tableCardsForBuild,
-      if (handCard != null) handCard,
+      handCard,
       ...stolenCards,
     ];
 
@@ -452,10 +413,8 @@ class KasinoEngine {
     }
 
     // Update hand
-    final newHand = List<PlayingCard>.from(player.hand);
-    if (handCard != null) {
-      newHand.removeWhere((c) => c.id == handCard.id);
-    }
+    final newHand = List<PlayingCard>.from(player.hand)
+      ..removeWhere((c) => c.id == handCard.id);
 
     // Remove used table cards (selected + auto-included)
     final usedIds = selectedIds.union(autoIncluded.map((c) => c.id).toSet());
@@ -497,7 +456,7 @@ class KasinoEngine {
       actionLog: _appendAction(state.actionLog, GameAction(
           playerId: player.id,
           type: actionType,
-          cardPlayed: handCard ?? tableCardsForBuild.first,
+          cardPlayed: handCard,
           cardsCaptured: stolenCards.isNotEmpty ? stolenCards : const [],
           description: stolenCards.isNotEmpty
               ? '${player.displayName} built ${finalBuild.displayString} (stole $stolenNames)'
